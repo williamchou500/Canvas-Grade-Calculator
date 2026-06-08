@@ -108,7 +108,7 @@ def extract_score(cell, debug_label=""):
 # -----------------------------
 # Main
 # -----------------------------
-def main(file_path):
+def run(file_path):
     print("\nLOADING FILE")
     print("=" * 80)
     print(file_path)
@@ -251,10 +251,16 @@ def main(file_path):
 # -----------------------------
 # Run
 # -----------------------------
-if __name__ == "__main__":
+
+def main():
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python calculate_grade.py file.html")
-    else:
-        main(sys.argv[1])
+        print("Usage: calculate-grade file.html")
+        return
+
+    run(sys.argv[1])
+
+
+if __name__ == "__main__":
+    main()
