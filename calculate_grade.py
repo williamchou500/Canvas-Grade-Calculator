@@ -3,45 +3,111 @@ from bs4 import BeautifulSoup
 from collections import defaultdict
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def parse_float(text):
     if text is None:
         return None
-    text = text.strip()
     try:
-        return float(text)
+        return float(text.strip())
     except:
         return None
 
 
-def extract_score(cell):
-    """
-    Correctly extracts:
-      earned = visible grade (span.original_score or span.grade)
-      possible = denominator from '/ X'
-    """
+def normalize(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
 
-    # --- FULL TEXT DEBUG ---
+
+def extract_possible(full_text, cell):
+    # -----------------------------
+    # 1. Standard "/ X"
+    # -----------------------------
+    match = re.search(r"/\s*([0-9]+(?:\.[0-9]+)?)", full_text)
+    if match:
+        return float(match.group(1))
+
+    # -----------------------------
+    # 2. Look for "out of X" (Canvas sometimes uses this internally)
+    # -----------------------------
+    match = re.search(r"out of\s*([0-9]+(?:\.[0-9]+)?)", full_text, re.I)
+    if match:
+        return float(match.group(1))
+
+    # -----------------------------
+    # 3. FALLBACK: infer from visible score patterns
+    # (VERY IMPORTANT for finals & quizzes)
+    # -----------------------------
+    # Example patterns:
+    # 87.5% 87.5 100% 100.0 100 100
+    perc_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", full_text)
+
+    if perc_match:
+        percent = float(perc_match.group(1))
+
+        # try hidden DOM hints (Canvas stores raw points sometimes)
+        hidden = cell.select_one(".original_score")
+        if hidden:
+            earned = float(hidden.get_text(strip=True))
+
+            # assume percent = earned / possible
+            if percent > 0:
+                possible = earned / (percent / 100.0)
+                return possible
+
+    # -----------------------------
+    # 4. LAST RESORT: treat as 100% single-point assignment
+    # (prevents dropping finals)
+    # -----------------------------
+    return None
+
+
+def extract_score(cell, debug_label=""):
     full_text = cell.get_text(" ", strip=True)
 
-    # 1. Earned score (best source: original_score or visible grade)
-    earned_tag = cell.select_one(".original_score") or cell.select_one(".grade")
+    earned = None
+    possible = None
 
-    earned = parse_float(earned_tag.get_text(strip=True)) if earned_tag else None
+    # -------------------------
+    # earned
+    # -------------------------
+    for sel in [".original_score", ".what_if_score"]:
+        tag = cell.select_one(sel)
+        if tag:
+            earned = parse_float(tag.get_text(strip=True))
+            if earned is not None:
+                break
 
-    # 2. Possible points → MUST come from "/ X"
-    match = re.search(r"/\s*([0-9]+(?:\.[0-9]+)?)", full_text)
-    possible = parse_float(match.group(1)) if match else None
+    if earned is None:
+        grade = cell.select_one(".grade")
+        if grade:
+            earned = parse_float(grade.get_text(strip=True))
 
-    # DEBUG per assignment
-    if earned is None or possible is None:
-        print("\nPARSE DEBUG")
-        print("TEXT:", full_text)
-        print("EARNED:", earned)
-        print("POSSIBLE:", possible)
+    if earned is None:
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", full_text)
+        if m:
+            earned = float(m.group(1))
+
+    # -------------------------
+    # possible (FIXED)
+    # -------------------------
+    possible = extract_possible(full_text, cell)
+
+    # DEBUG ONLY WHEN FAILING
+    if possible is None or "final" in full_text.lower():
+        print("\nFINAL PARSE DEBUG")
+        print(debug_label)
+        print(full_text)
+        print("earned:", earned)
+        print("possible:", possible)
+        print("-" * 60)
 
     return earned, possible
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main(file_path):
     print("\nLOADING FILE")
     print("=" * 80)
@@ -50,31 +116,34 @@ def main(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
         soup = BeautifulSoup(f, "html.parser")
 
-    # --- WEIGHT TABLE ---
-    weights = {}
+    # -----------------------------
+    # WEIGHTS
+    # -----------------------------
     print("\nWEIGHT DEBUG")
     print("=" * 80)
 
-    weight_rows = soup.select("div[aria-label='Assignment Weights'] tbody tr")
+    weights = {}
 
-    for row in weight_rows:
-        cols = row.find_all("td")
+    rows = soup.select("div[aria-label='Assignment Weights'] tbody tr")
+
+    for row in rows:
         th = row.find("th")
-        if not th or len(cols) < 1:
+        td = row.find("td")
+        if not th or not td:
             continue
 
         group = th.get_text(strip=True)
-        weight_text = cols[0].get_text(strip=True)
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", td.get_text())
 
-        match = re.search(r"([0-9.]+)", weight_text)
         if match:
-            weights[group] = float(match.group(1)) / 100.0
+            weights[normalize(group)] = float(match.group(1)) / 100.0
 
-    print(f"Total weights loaded: {len(weights)}")
     for k, v in weights.items():
-        print(f"  {k}: {v}")
+        print(f"{k}: {v}")
 
-    # --- ASSIGNMENTS ---
+    # -----------------------------
+    # ASSIGNMENTS
+    # -----------------------------
     print("\nASSIGNMENTS")
     print("=" * 80)
 
@@ -84,38 +153,40 @@ def main(file_path):
 
     group_scores = defaultdict(lambda: {"earned": 0.0, "possible": 0.0})
 
-    parsed_count = 0
+    parsed = 0
 
     for i, row in enumerate(rows, 1):
         title = row.select_one(".title")
         group = row.select_one(".context")
-        score_cell = row.select_one(".assignment_score")
+        cell = row.select_one(".assignment_score")
 
-        if not title or not group or not score_cell:
+        if not title or not group or not cell:
             continue
 
         name = title.get_text(" ", strip=True)
         group_name = group.get_text(strip=True)
 
-        earned, possible = extract_score(score_cell)
+        earned, possible = extract_score(cell, debug_label=name)
 
-        print(f"\nAssignment #{i}")
-        print("  Name:", name)
-        print("  Group:", group_name)
-        print("  Earned:", earned)
-        print("  Possible:", possible)
+        print(f"\n{name}")
+        print(f"  Group: {group_name}")
+        print(f"  {earned} / {possible}")
 
         if earned is None or possible is None:
-            print("  ❌ Skipped (parse failure)")
+            print("  ❌ skipped")
             continue
 
-        parsed_count += 1
-        group_scores[group_name]["earned"] += earned
-        group_scores[group_name]["possible"] += possible
+        parsed += 1
+        gkey = normalize(group_name)
 
-    print(f"\nParsed assignments: {parsed_count}")
+        group_scores[gkey]["earned"] += earned
+        group_scores[gkey]["possible"] += possible
 
-    # --- GROUP TOTALS ---
+    print(f"\nParsed assignments: {parsed}")
+
+    # -----------------------------
+    # GROUP TOTALS
+    # -----------------------------
     print("\nGROUP TOTALS")
     print("=" * 80)
 
@@ -129,26 +200,31 @@ def main(file_path):
             continue
 
         percent = earned / possible
-        weight = weights.get(group, 0)
+        weight = weights.get(group, 0.0)
 
         weighted = percent * weight
         overall += weighted
 
-        print(f"{group}")
-        print(f"  Score: {earned:.2f}/{possible:.2f}")
-        print(f"  Percent: {percent:.4f}")
-        print(f"  Weight: {weight:.2f}")
-        print(f"  Weighted: {weighted:.4f}")
+        print(f"\n{group}")
+        print(f"  {earned:.2f} / {possible:.2f}")
+        print(f"  {percent:.3%}")
+        print(f"  weight: {weight:.2%}")
+        print(f"  weighted: {weighted:.3%}")
 
-    # --- OVERALL ---
+    # -----------------------------
+    # FINAL OUTPUT
+    # -----------------------------
     print("\nOVERALL GRADE")
     print("=" * 80)
     print(f"{overall * 100:.2f}%")
 
 
+# -----------------------------
+# Run
+# -----------------------------
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python calculate_grade.py <file.html>")
+        print("Usage: python calculate_grade.py file.html")
     else:
         main(sys.argv[1])
