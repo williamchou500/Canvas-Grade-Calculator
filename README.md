@@ -14,3 +14,6 @@ If no weights are found on the HTML page, it will calculate your grade by taking
 
 if your HTML's file path is  "C:\Users\willi\OneDrive\Desktop\grades.html", you would run this in your command line:
     python calculate_grade.py "C:\Users\willi\OneDrive\Desktop\grades.html"
+
+For testing, there is a sample_grades.html file included in this folder. You can run the following to test the code:
+    python calculate_grade.py sample_grades.html
