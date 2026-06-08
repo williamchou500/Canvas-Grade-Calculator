@@ -19,46 +19,51 @@ def normalize(text):
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+def normalize_weights(weights):
+    """Return usable weights or None if missing/unusable."""
+    vals = list(weights.values())
+
+    if len(vals) == 0:
+        return None
+
+    # if everything is basically zero → treat as no weights
+    if sum(vals) < 0.01:
+        return None
+
+    return weights
+
+
+# -----------------------------
+# Score extraction
+# -----------------------------
 def extract_possible(full_text, cell):
-    # -----------------------------
     # 1. Standard "/ X"
-    # -----------------------------
     match = re.search(r"/\s*([0-9]+(?:\.[0-9]+)?)", full_text)
     if match:
         return float(match.group(1))
 
-    # -----------------------------
-    # 2. Look for "out of X" (Canvas sometimes uses this internally)
-    # -----------------------------
+    # 2. "out of X"
     match = re.search(r"out of\s*([0-9]+(?:\.[0-9]+)?)", full_text, re.I)
     if match:
         return float(match.group(1))
 
-    # -----------------------------
-    # 3. FALLBACK: infer from visible score patterns
-    # (VERY IMPORTANT for finals & quizzes)
-    # -----------------------------
-    # Example patterns:
-    # 87.5% 87.5 100% 100.0 100 100
+    # 3. Percent-based fallback
     perc_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", full_text)
-
     if perc_match:
         percent = float(perc_match.group(1))
 
-        # try hidden DOM hints (Canvas stores raw points sometimes)
         hidden = cell.select_one(".original_score")
         if hidden:
-            earned = float(hidden.get_text(strip=True))
+            earned = parse_float(hidden.get_text(strip=True))
+            if earned is not None and percent > 0:
+                return earned / (percent / 100.0)
 
-            # assume percent = earned / possible
-            if percent > 0:
-                possible = earned / (percent / 100.0)
-                return possible
+        return 100.0
 
-    # -----------------------------
-    # 4. LAST RESORT: treat as 100% single-point assignment
-    # (prevents dropping finals)
-    # -----------------------------
+    # 4. FINAL SAFETY NET (prevents dropping finals)
+    if "%" in full_text:
+        return 100.0
+
     return None
 
 
@@ -89,18 +94,13 @@ def extract_score(cell, debug_label=""):
             earned = float(m.group(1))
 
     # -------------------------
-    # possible (FIXED)
+    # possible
     # -------------------------
     possible = extract_possible(full_text, cell)
 
-    # DEBUG ONLY WHEN FAILING
-    if possible is None or "final" in full_text.lower():
-        print("\nFINAL PARSE DEBUG")
-        print(debug_label)
-        print(full_text)
-        print("earned:", earned)
-        print("possible:", possible)
-        print("-" * 60)
+    if earned is not None and possible is None:
+        if "%" in full_text:
+            possible = 100.0
 
     return earned, possible
 
@@ -152,10 +152,9 @@ def main(file_path):
     print(f"Found {len(rows)} assignment rows")
 
     group_scores = defaultdict(lambda: {"earned": 0.0, "possible": 0.0})
-
     parsed = 0
 
-    for i, row in enumerate(rows, 1):
+    for row in rows:
         title = row.select_one(".title")
         group = row.select_one(".context")
         cell = row.select_one(".assignment_score")
@@ -172,9 +171,13 @@ def main(file_path):
         print(f"  Group: {group_name}")
         print(f"  {earned} / {possible}")
 
-        if earned is None or possible is None:
-            print("  ❌ skipped")
+        if earned is None:
+            print("  ❌ skipped (no earned score)")
             continue
+
+        if possible is None:
+            print("  ⚠️ fixing missing possible → assuming 100")
+            possible = 100.0
 
         parsed += 1
         gkey = normalize(group_name)
@@ -190,33 +193,59 @@ def main(file_path):
     print("\nGROUP TOTALS")
     print("=" * 80)
 
-    overall = 0.0
+    usable_weights = normalize_weights(weights)
 
-    for group, vals in group_scores.items():
-        earned = vals["earned"]
-        possible = vals["possible"]
+    if usable_weights is None:
+        # =========================
+        # TRUE POINTS-BASED MODE
+        # =========================
+        print("\n⚠️ No valid weights detected → using TOTAL POINTS mode\n")
 
-        if possible == 0:
-            continue
+        total_earned = 0.0
+        total_possible = 0.0
 
-        percent = earned / possible
-        weight = weights.get(group, 0.0)
+        for group, vals in group_scores.items():
+            if vals["possible"] > 0:
+                total_earned += vals["earned"]
+                total_possible += vals["possible"]
 
-        weighted = percent * weight
-        overall += weighted
+        if total_possible == 0:
+            overall = 0.0
+        else:
+            overall = total_earned / total_possible
 
-        print(f"\n{group}")
-        print(f"  {earned:.2f} / {possible:.2f}")
-        print(f"  {percent:.3%}")
-        print(f"  weight: {weight:.2%}")
-        print(f"  weighted: {weighted:.3%}")
+        print(f"TOTAL EARNED: {total_earned:.2f}")
+        print(f"TOTAL POSSIBLE: {total_possible:.2f}")
+        print(f"OVERALL: {overall:.3%}")
 
-    # -----------------------------
-    # FINAL OUTPUT
-    # -----------------------------
-    print("\nOVERALL GRADE")
-    print("=" * 80)
-    print(f"{overall * 100:.2f}%")
+    else:
+        # =========================
+        # WEIGHTED MODE
+        # =========================
+        overall = 0.0
+
+        for group, vals in group_scores.items():
+            earned = vals["earned"]
+            possible = vals["possible"]
+
+            if possible == 0:
+                continue
+
+            percent = earned / possible
+            weight = usable_weights.get(group, 0.0)
+
+            weighted = percent * weight
+            overall += weighted
+
+            print(f"\n{group}")
+            print(f"  {earned:.2f} / {possible:.2f}")
+            print(f"  {percent:.3%}")
+            print(f"  weight: {weight:.2%}")
+            print(f"  weighted: {weighted:.3%}")
+
+        print("\nOVERALL GRADE")
+        print("=" * 80)
+        print(f"{overall * 100:.2f}%")
 
 
 # -----------------------------
@@ -224,6 +253,7 @@ def main(file_path):
 # -----------------------------
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
         print("Usage: python calculate_grade.py file.html")
     else:
