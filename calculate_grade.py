@@ -259,8 +259,17 @@ def main():
         print("Usage: calculate-grade file.html")
         return
 
-    run(sys.argv[1])
+    arg = sys.argv[1]
 
+    # -----------------------------
+    # HANDLE HELP FLAGS SAFELY
+    # -----------------------------
+    if arg in ("--help", "-h", "help"):
+        print("Usage: calculate-grade <file.html>")
+        print("Computes Canvas grade from exported HTML file.")
+        return
+
+    run(arg)
 
 if __name__ == "__main__":
     main()
