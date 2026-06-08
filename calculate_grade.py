@@ -8,79 +8,73 @@ import sys
 @dataclass
 class Assignment:
     name: str
+    group: str
     earned: float
     possible: float
-    group: str | None = None
 
 
-def load_html(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return BeautifulSoup(f.read(), "html.parser")
-
-
-def parse_score(text):
-    """
-    Converts strings like:
-    '95 / 100'
-    '17.5/20'
-
-    into:
-    (95.0, 100.0)
-    """
-
-    match = re.search(
-        r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",
-        text
-    )
-
-    if not match:
-        raise ValueError(f"No score found in: {text}")
-
-    return (
-        float(match.group(1)),
-        float(match.group(2))
-    )
+def load_html(filename):
+    with open(filename, "r", encoding="utf-8") as f:
+        return BeautifulSoup(f, "html.parser")
 
 
 def extract_assignments(soup):
-    """
-    Generic table parser.
-
-    You may need to adjust selectors depending
-    on your Canvas HTML.
-    """
-
     assignments = []
 
-    rows = soup.find_all("tr")
+    rows = soup.select("tr.student_assignment")
 
     for row in rows:
 
-        row_text = row.get_text(" ", strip=True)
+        title_cell = row.select_one("th.title")
+        if not title_cell:
+            continue
+
+        name_link = title_cell.select_one("a")
+        context_div = title_cell.select_one(".context")
+
+        name = (
+            name_link.get_text(strip=True)
+            if name_link
+            else "Unknown Assignment"
+        )
+
+        group = (
+            context_div.get_text(strip=True)
+            if context_div
+            else "Uncategorized"
+        )
+
+        score_cell = row.select_one("td.assignment_score")
+        if not score_cell:
+            continue
+
+        grade_span = score_cell.select_one("span.grade")
+        if not grade_span:
+            continue
 
         try:
-            earned, possible = parse_score(row_text)
+            earned = float(grade_span.get_text(strip=True))
         except ValueError:
             continue
 
-        cells = row.find_all(["td", "th"])
+        score_text = score_cell.get_text(" ", strip=True)
 
-        if len(cells) == 0:
+        possible_match = re.search(
+            r"/\s*(\d+(?:\.\d+)?)",
+            score_text
+        )
+
+        if not possible_match:
             continue
 
-        name = cells[0].get_text(strip=True)
-
-        group = None
-
-        if len(cells) >= 3:
-            group = cells[2].get_text(strip=True)
+        possible = float(possible_match.group(1))
 
         assignments.append(
             Assignment(
                 name=name,
+                group=group,
                 earned=earned,
-                possible=possible,
-                group=group
+                possible=possible
             )
         )
 
@@ -88,96 +82,135 @@ def extract_assignments(soup):
 
 
 def extract_weights(soup):
-    """
-    Attempts to find category weights.
-
-    Looks for patterns like:
-    Homework 20%
-    Exams 50%
-
-    Returns:
-    {
-        "Homework": 20.0,
-        "Exams": 50.0
-    }
-    """
-
     weights = {}
 
-    text = soup.get_text("\n", strip=True)
+    header = soup.find("h2", string=re.compile(
+        "Assignments are weighted by group",
+        re.I
+    ))
 
-    pattern = re.compile(
-        r"([A-Za-z][A-Za-z\s]+?)\s+(\d+(?:\.\d+)?)%"
-    )
+    if not header:
+        return weights
 
-    for match in pattern.finditer(text):
-        category = match.group(1).strip()
-        weight = float(match.group(2))
+    table = header.find_next("table")
 
-        if 0 < weight <= 100:
-            weights[category] = weight
+    if not table:
+        return weights
+
+    rows = table.select("tbody tr")
+
+    for row in rows:
+
+        group_cell = row.find("th")
+        weight_cell = row.find("td")
+
+        if not group_cell or not weight_cell:
+            continue
+
+        group = group_cell.get_text(strip=True)
+
+        if group.lower() == "total":
+            continue
+
+        weight_text = weight_cell.get_text(strip=True)
+
+        match = re.search(
+            r"(\d+(?:\.\d+)?)%",
+            weight_text
+        )
+
+        if not match:
+            continue
+
+        weight = float(match.group(1))
+
+        weights[group] = weight
 
     return weights
 
 
-def calculate_point_grade(assignments):
-    earned = sum(a.earned for a in assignments)
-    possible = sum(a.possible for a in assignments)
-
-    if possible == 0:
-        return 0
-
-    return earned / possible
-
-
-def calculate_weighted_grade(assignments, weights):
-    groups = defaultdict(list)
+def calculate_group_grades(assignments):
+    groups = defaultdict(
+        lambda: {"earned": 0, "possible": 0}
+    )
 
     for a in assignments:
-        if a.group:
-            groups[a.group].append(a)
+        groups[a.group]["earned"] += a.earned
+        groups[a.group]["possible"] += a.possible
 
-    weighted_total = 0
-    used_weight = 0
+    results = {}
 
-    for group_name, weight in weights.items():
+    for group, data in groups.items():
 
-        group_assignments = groups.get(group_name)
-
-        if not group_assignments:
+        if data["possible"] == 0:
             continue
 
-        earned = sum(a.earned for a in group_assignments)
-        possible = sum(a.possible for a in group_assignments)
+        results[group] = (
+            data["earned"] /
+            data["possible"]
+        )
 
-        if possible == 0:
+    return results
+
+
+def calculate_weighted_grade(group_grades, weights):
+    total = 0
+
+    for group, weight in weights.items():
+
+        if weight == 0:
             continue
 
-        percentage = earned / possible
+        if group not in group_grades:
+            continue
 
-        weighted_total += percentage * weight
-        used_weight += weight
+        total += (
+            group_grades[group]
+            * weight
+        )
 
-    if used_weight == 0:
-        return calculate_point_grade(assignments)
-
-    return weighted_total / used_weight
+    return total / 100
 
 
-def print_assignments(assignments):
-    print("\nAssignments")
-    print("-" * 60)
+def print_report(assignments, weights):
+    print("\nASSIGNMENTS")
+    print("=" * 80)
 
     for a in assignments:
         print(
-            f"{a.name:<30} "
-            f"{a.earned:>6.1f}/{a.possible:<6.1f} "
-            f"{a.group or 'Ungrouped'}"
+            f"{a.name}\n"
+            f"  Group: {a.group}\n"
+            f"  Score: {a.earned}/{a.possible}\n"
         )
+
+    group_grades = calculate_group_grades(assignments)
+
+    print("\nGROUP TOTALS")
+    print("=" * 80)
+
+    for group, pct in sorted(group_grades.items()):
+
+        weight = weights.get(group, 0)
+
+        print(
+            f"{group:<40}"
+            f"{pct*100:>7.2f}%"
+            f"   weight={weight}%"
+        )
+
+    overall = calculate_weighted_grade(
+        group_grades,
+        weights
+    )
+
+    print("\nOVERALL GRADE")
+    print("=" * 80)
+    print(f"{overall*100:.2f}%")
+
+    return overall
 
 
 def main():
-
     if len(sys.argv) != 2:
         print(
             "Usage:\n"
@@ -185,45 +218,12 @@ def main():
         )
         return
 
-    html_file = sys.argv[1]
-
-    soup = load_html(html_file)
+    soup = load_html(sys.argv[1])
 
     assignments = extract_assignments(soup)
-
-    if not assignments:
-        print("No assignments found.")
-        return
-
     weights = extract_weights(soup)
 
-    print_assignments(assignments)
-
-    print("\nDetected Weights")
-    print("-" * 60)
-
-    if weights:
-        for group, weight in weights.items():
-            print(f"{group}: {weight}%")
-
-        grade = calculate_weighted_grade(
-            assignments,
-            weights
-        )
-
-        print(
-            f"\nWeighted Grade: {grade * 100:.2f}%"
-        )
-
-    else:
-        grade = calculate_point_grade(assignments)
-
-        print(
-            "\nNo assignment weights detected."
-        )
-        print(
-            f"Point-Based Grade: {grade * 100:.2f}%"
-        )
+    print_report(assignments, weights)
 
 
 if __name__ == "__main__":
